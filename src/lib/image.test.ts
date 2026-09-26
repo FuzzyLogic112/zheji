@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  exportPng,
   inspectImageBytes,
   loadImage,
   MAX_FILE_BYTES,
@@ -39,6 +40,101 @@ const watermark: Watermark = {
   opacity: 0.18,
   color: "#000000",
 };
+
+// Build well-formed chunks so parser regressions exercise structure, not a
+// coincidental checksum failure. This deliberately uses a bitwise CRC loop
+// independent of the production table implementation.
+function pngChunk(
+  type: string,
+  data: Uint8Array = new Uint8Array(),
+): Uint8Array {
+  const chunk = new Uint8Array(data.length + 12);
+  const view = new DataView(chunk.buffer);
+  view.setUint32(0, data.length);
+  chunk.set(new TextEncoder().encode(type), 4);
+  chunk.set(data, 8);
+  let crc = 0xffffffff;
+  for (const byte of chunk.subarray(4, chunk.length - 4)) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++)
+      crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
+  }
+  view.setUint32(chunk.length - 4, (crc ^ 0xffffffff) >>> 0);
+  return chunk;
+}
+
+function pngChunks(fixture: keyof typeof fixtures = "png") {
+  const input = bytes(fixture);
+  const chunks: { type: string; data: Uint8Array }[] = [];
+  for (let offset = 8; offset < input.length;) {
+    const length = new DataView(input.buffer).getUint32(offset);
+    chunks.push({
+      type: new TextDecoder().decode(input.subarray(offset + 4, offset + 8)),
+      data: input.slice(offset + 8, offset + 8 + length),
+    });
+    offset += length + 12;
+  }
+  return chunks;
+}
+
+function pngFrom(chunks: ReturnType<typeof pngChunks>): Uint8Array {
+  const encoded = chunks.map(({ type, data }) => pngChunk(type, data));
+  const output = new Uint8Array(
+    8 + encoded.reduce((sum, chunk) => sum + chunk.length, 0),
+  );
+  output.set(bytes("png").subarray(0, 8));
+  let offset = 8;
+  for (const chunk of encoded) {
+    output.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return output;
+}
+
+type DrawCall = {
+  operation: string;
+  args: unknown[];
+  alpha: number;
+  color: string;
+  composite: string;
+};
+
+function mockCanvas(encode?: (callback: BlobCallback, type?: string) => void) {
+  const calls: DrawCall[] = [];
+  const context = {
+    globalAlpha: 1,
+    fillStyle: "#000000",
+    globalCompositeOperation: "source-over",
+    translate: vi.fn(),
+    rotate: vi.fn(),
+    save: vi.fn(),
+    restore: vi.fn(),
+    measureText: vi.fn().mockReturnValue({ width: 120 }),
+    drawImage: vi.fn(),
+    fillRect: vi.fn(),
+    fillText: vi.fn(),
+  };
+  for (const operation of ["drawImage", "fillRect", "fillText"] as const) {
+    context[operation].mockImplementation((...args: unknown[]) => {
+      calls.push({
+        operation,
+        args,
+        alpha: context.globalAlpha,
+        color: context.fillStyle,
+        composite: context.globalCompositeOperation,
+      });
+    });
+  }
+  const canvas = {
+    width: 0,
+    height: 0,
+    getContext: vi.fn().mockReturnValue(context),
+    toBlob: vi.fn(encode),
+  };
+  const createElement = vi.fn().mockReturnValue(canvas);
+  vi.stubGlobal("document", { createElement });
+  return { canvas, context, calls, createElement };
+}
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -293,5 +389,325 @@ describe("export metadata removal", () => {
   it("rejects truncated or animated output instead of passing it through", () => {
     expect(() => stripPngMetadata(bytes("png").subarray(0, 50))).toThrow();
     expect(() => stripPngMetadata(bytes("apng"))).toThrow("动画 PNG");
+  });
+});
+
+describe("adversarial PNG structure", () => {
+  it("checks every truncated prefix rather than only representative offsets", () => {
+    for (const fixture of ["png", "palette", "jpeg", "progressive"] as const) {
+      const input = bytes(fixture);
+      for (let length = 0; length < input.length; length++) {
+        expect(() => inspectImageBytes(input.subarray(0, length))).toThrow();
+      }
+    }
+  });
+
+  it.each(["acTL", "fcTL", "fdAT"])(
+    "rejects the %s animation marker even in a custom valid-CRC chunk",
+    (type) => {
+      const chunks = pngChunks();
+      chunks.splice(1, 0, { type, data: new Uint8Array() });
+      expect(() => inspectImageBytes(pngFrom(chunks))).toThrow("动画 PNG");
+    },
+  );
+
+  it("rejects duplicate headers and unknown critical chunks", () => {
+    const chunks = pngChunks();
+    expect(() => inspectImageBytes(pngFrom([chunks[0]!, ...chunks]))).toThrow(
+      "图片头重复",
+    );
+    chunks.splice(1, 0, { type: "ABCD", data: new Uint8Array() });
+    expect(() => inspectImageBytes(pngFrom(chunks))).toThrow("关键区块");
+  });
+
+  it.each([
+    [8, 3],
+    [9, 1],
+    [10, 1],
+    [11, 1],
+    [12, 2],
+  ])("rejects invalid IHDR field %s = %s with a valid CRC", (offset, value) => {
+    const chunks = pngChunks();
+    chunks[0]!.data[offset] = value;
+    expect(() => inspectImageBytes(pngFrom(chunks))).toThrow("编码参数无效");
+  });
+
+  it("requires an indexed palette and rejects oversized or misplaced palettes", () => {
+    const indexed = pngChunks("palette");
+    expect(() =>
+      inspectImageBytes(
+        pngFrom(
+          indexed.filter(({ type }) => type !== "PLTE" && type !== "tRNS"),
+        ),
+      ),
+    ).toThrow("像素区块顺序");
+    const palette = indexed.find(({ type }) => type === "PLTE")!;
+    palette.data = new Uint8Array(9); // A 1-bit indexed image permits two entries.
+    expect(() => inspectImageBytes(pngFrom(indexed))).toThrow("调色板结构");
+    const rgb = pngChunks();
+    rgb.splice(-1, 0, { type: "PLTE", data: new Uint8Array(3) });
+    expect(() => inspectImageBytes(pngFrom(rgb))).toThrow("调色板结构");
+  });
+
+  it("accepts consecutive split IDAT chunks but rejects interrupted pixel data", () => {
+    const [header, data, end] = pngChunks();
+    const split = [
+      header!,
+      { type: "IDAT", data: data!.data.slice(0, 5) },
+      { type: "IDAT", data: data!.data.slice(5) },
+      end!,
+    ];
+    expect(inspectImageBytes(pngFrom(split))).toMatchObject({
+      width: 3,
+      height: 2,
+    });
+    split.splice(2, 0, {
+      type: "tEXt",
+      data: new TextEncoder().encode("Comment\0private"),
+    });
+    expect(() => inspectImageBytes(pngFrom(split))).toThrow("像素区块顺序");
+  });
+
+  it("does not accept empty IDAT as pixel data", () => {
+    const chunks = pngChunks();
+    chunks[1]!.data = new Uint8Array();
+    expect(() => inspectImageBytes(pngFrom(chunks))).toThrow("像素数据缺失");
+  });
+
+  it("removes valid ancillary chunks before and after the pixels", () => {
+    const chunks = pngChunks();
+    chunks.splice(1, 0, {
+      type: "pHYs",
+      data: new Uint8Array([0, 0, 11, 19, 0, 0, 11, 19, 1]),
+    });
+    chunks.splice(-1, 0, {
+      type: "tEXt",
+      data: new TextEncoder().encode("Comment\0PRIVATE TRAILING COMMENT"),
+    });
+    expect(stripPngMetadata(pngFrom(chunks))).toEqual(bytes("png"));
+  });
+
+  it("can clean encoded output larger than the input file limit", () => {
+    const chunks = pngChunks();
+    chunks.splice(1, 0, {
+      type: "vpAg",
+      data: new Uint8Array(MAX_FILE_BYTES),
+    });
+    const input = pngFrom(chunks);
+    expect(() => inspectImageBytes(input)).toThrow("20 MiB");
+    expect(stripPngMetadata(input)).toEqual(bytes("png"));
+  });
+});
+
+describe("loading failure boundaries", () => {
+  it("reports unreadable files without allocating a bitmap", async () => {
+    const decode = vi.fn();
+    vi.stubGlobal("createImageBitmap", decode);
+    await expect(
+      loadImage({
+        size: 100,
+        arrayBuffer: vi.fn().mockRejectedValue(new Error("disk unavailable")),
+      } as unknown as File),
+    ).rejects.toThrow("无法读取图片文件");
+    expect(decode).not.toHaveBeenCalled();
+  });
+
+  it("rechecks actual bytes when a file-like object understates its size", async () => {
+    const decode = vi.fn();
+    vi.stubGlobal("createImageBitmap", decode);
+    await expect(
+      loadImage({
+        size: 1,
+        arrayBuffer: vi
+          .fn()
+          .mockResolvedValue(new ArrayBuffer(MAX_FILE_BYTES + 1)),
+      } as unknown as File),
+    ).rejects.toThrow("20 MiB");
+    expect(decode).not.toHaveBeenCalled();
+  });
+});
+
+describe("render ordering and geometry", () => {
+  it("draws watermarks before opaque outward-rounded covers, including overlaps", () => {
+    const { canvas, context, calls } = mockCanvas();
+    const source = {} as CanvasImageSource;
+    renderCanvas(
+      source,
+      300,
+      200,
+      [
+        {
+          id: "first",
+          x: -2.4,
+          y: 1.1,
+          width: 12.6,
+          height: 5.2,
+          color: "#123456",
+        },
+        { id: "second", x: 5, y: 4, width: 10, height: 10, color: "#abcdef" },
+      ],
+      null,
+      { ...watermark, enabled: true, text: "仅供验证", opacity: 0.3 },
+    );
+    expect([canvas.width, canvas.height]).toEqual([300, 200]);
+    expect(canvas.getContext).toHaveBeenCalledWith("2d", { alpha: false });
+    expect(calls[0]).toMatchObject({
+      operation: "fillRect",
+      args: [0, 0, 300, 200],
+      color: "#ffffff",
+      alpha: 1,
+    });
+    expect(calls[1]).toMatchObject({
+      operation: "drawImage",
+      args: [source, 0, 0, 300, 200],
+    });
+    const marks = calls.filter(({ operation }) => operation === "fillText");
+    expect(marks.length).toBeGreaterThan(0);
+    expect(marks.every(({ alpha }) => alpha === 0.3)).toBe(true);
+    expect(calls.slice(-2)).toEqual([
+      {
+        operation: "fillRect",
+        args: [0, 1, 11, 6],
+        color: "#123456",
+        alpha: 1,
+        composite: "source-over",
+      },
+      {
+        operation: "fillRect",
+        args: [5, 4, 10, 10],
+        color: "#abcdef",
+        alpha: 1,
+        composite: "source-over",
+      },
+    ]);
+  });
+
+  it("keeps crop drawing in image coordinates and the same watermark grid", () => {
+    const settings = { ...watermark, enabled: true, text: "仅供验证" };
+    const full = mockCanvas();
+    renderCanvas({} as CanvasImageSource, 900, 600, [], null, settings);
+    const crop = mockCanvas();
+    renderCanvas(
+      {} as CanvasImageSource,
+      900,
+      600,
+      [{ id: "cover", x: 100, y: 80, width: 70, height: 30, color: "#000" }],
+      { x: 99.2, y: 79.6, width: 150.4, height: 110.8 },
+      settings,
+    );
+    expect([crop.canvas.width, crop.canvas.height]).toEqual([151, 112]);
+    expect(crop.context.translate.mock.calls).toEqual([
+      [-99, -79],
+      [450, 300],
+    ]);
+    const fullPositions = full.calls
+      .filter(({ operation }) => operation === "fillText")
+      .map(({ args }) => args);
+    const cropPositions = crop.calls
+      .filter(({ operation }) => operation === "fillText")
+      .map(({ args }) => args);
+    expect(cropPositions.length).toBeGreaterThan(0);
+    for (const position of cropPositions)
+      expect(fullPositions).toContainEqual(position);
+    expect(crop.calls.at(-1)?.args).toEqual([100, 80, 70, 30]);
+  });
+
+  it.each([NaN, Infinity, -Infinity, -1])(
+    "rejects invalid cover width %s before canvas allocation",
+    (width) => {
+      const { createElement } = mockCanvas();
+      expect(() =>
+        renderCanvas(
+          {} as CanvasImageSource,
+          10,
+          10,
+          [{ id: "bad", x: 0, y: 0, width, height: 1, color: "#000" }],
+          null,
+          watermark,
+        ),
+      ).toThrow("尺寸无效");
+      expect(createElement).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects an out-of-bounds crop before canvas allocation", () => {
+    const { createElement } = mockCanvas();
+    expect(() =>
+      renderCanvas(
+        {} as CanvasImageSource,
+        10,
+        10,
+        [],
+        { x: 10, y: 0, width: 1, height: 1 },
+        watermark,
+      ),
+    ).toThrow("实际面积");
+    expect(createElement).not.toHaveBeenCalled();
+  });
+});
+
+describe("encoded export and temporary canvas ownership", () => {
+  it("waits for encoding before releasing pixels and strips metadata from the returned PNG", async () => {
+    let finish: BlobCallback | undefined;
+    const { canvas } = mockCanvas((callback) => {
+      finish = callback;
+    });
+    const result = exportPng(
+      {} as CanvasImageSource,
+      3,
+      2,
+      [],
+      null,
+      watermark,
+    );
+    expect([canvas.width, canvas.height]).toEqual([3, 2]);
+    expect(canvas.toBlob).toHaveBeenCalledWith(
+      expect.any(Function),
+      "image/png",
+    );
+    finish!(new Blob([bytes("metadata")], { type: "image/png" }));
+    const output = await result;
+    expect(output.type).toBe("image/png");
+    expect(new Uint8Array(await output.arrayBuffer())).toEqual(bytes("png"));
+    expect([canvas.width, canvas.height]).toEqual([0, 0]);
+  });
+
+  it.each(["null", "throw"])(
+    "releases the canvas after an encoder %s failure",
+    async (kind) => {
+      const { canvas } = mockCanvas((callback) => {
+        if (kind === "throw") throw new Error("encoder unavailable");
+        callback(null);
+      });
+      await expect(
+        exportPng({} as CanvasImageSource, 3, 2, [], null, watermark),
+      ).rejects.toThrow("图片导出失败");
+      expect([canvas.width, canvas.height]).toEqual([0, 0]);
+    },
+  );
+
+  it.each(["jpeg", "apng"] as const)(
+    "rejects unexpected encoded %s instead of returning a mislabeled PNG",
+    async (fixture) => {
+      const { canvas } = mockCanvas((callback) =>
+        callback(new Blob([bytes(fixture)])),
+      );
+      await expect(
+        exportPng({} as CanvasImageSource, 3, 2, [], null, watermark),
+      ).rejects.toThrow();
+      expect([canvas.width, canvas.height]).toEqual([0, 0]);
+    },
+  );
+
+  it("releases the canvas even if reading the encoded blob fails", async () => {
+    const encoded = new Blob([bytes("png")]);
+    vi.spyOn(encoded, "arrayBuffer").mockRejectedValue(
+      new Error("blob read failed"),
+    );
+    const { canvas } = mockCanvas((callback) => callback(encoded));
+    await expect(
+      exportPng({} as CanvasImageSource, 3, 2, [], null, watermark),
+    ).rejects.toThrow("blob read failed");
+    expect([canvas.width, canvas.height]).toEqual([0, 0]);
   });
 });
