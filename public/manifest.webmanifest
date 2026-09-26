@@ -1,0 +1,18 @@
+{
+  "name": "遮迹 · 图片隐私处理",
+  "short_name": "遮迹",
+  "lang": "zh-CN",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f5f4f0",
+  "theme_color": "#202a3c",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
