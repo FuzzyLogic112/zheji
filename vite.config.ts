@@ -13,6 +13,7 @@ export default defineConfig({
           "index.html",
           "icon.svg",
           "manifest.webmanifest",
+          "THIRD-PARTY-NOTICES.txt",
           ...Object.keys(bundle),
         ];
         const version = createHash("sha256")

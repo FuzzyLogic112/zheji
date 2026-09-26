@@ -75,6 +75,8 @@ npm run preview   # 启动正式版，检查离线缓存
 
 React + TypeScript + Vite + 原生 Canvas；界面图标使用 lucide-react。核心处理没有联网服务与运行时图片处理依赖。
 
+本项目采用 MIT 许可；随构建分发的第三方许可见 [THIRD-PARTY-NOTICES.txt](public/THIRD-PARTY-NOTICES.txt)。
+
 `dist/` 可部署到 HTTPS 静态服务器，支持子目录路径。仓库已包含 GitHub Pages 和 CI 工作流。新版本缓存通常在关闭旧页面后重新打开生效。
 
 图片本身不会上传；托管方仍可能记录静态网页访问。敏感场景可以本机运行或在独立来源自托管。浏览器扩展或能访问当前页面的同源代码不在应用的隔离边界内。
