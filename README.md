@@ -1,3 +1,5 @@
+<img src="public/icon.svg" alt="遮迹图标" width="64">
+
 # 遮迹 Zheji
 
 **分享之前，留一点隐私。**
@@ -7,6 +9,13 @@
 [在线使用](https://fuzzylogic112.github.io/zheji/) · [调研依据](docs/RESEARCH.md) · [验证记录](docs/QA.md)
 
 ![遮迹工作台，使用虚构演示图片](docs/images/editor.png)
+
+<details>
+<summary>手机端截图</summary>
+
+<img src="docs/images/mobile.png" alt="遮迹手机端界面，使用虚构演示图片" width="320">
+
+</details>
 
 ## 解决什么问题
 
@@ -27,6 +36,8 @@
 原始图片文件不会被修改。图片和编辑历史仅存在当前页面内存中，不写入 IndexedDB 或 localStorage，刷新/关闭后不保留。应用缓存只有网页代码、样式和图标。
 
 ## 快速使用
+
+![打开后的欢迎页，可选择图片或体验虚构示例](docs/images/welcome.png)
 
 1. 打开在线版，选择图片或先体验虚构示例。
 2. 拖出矩形遮盖区域；也可点“精确添加”，输入原图像素坐标。选择区域后按 Delete 删除。
